@@ -440,7 +440,9 @@ async def test_safe_sync_slash_commands_only_mutates_diffs():
 
 
 @pytest.mark.asyncio
-async def test_post_connect_initialization_retries_fingerprint_after_timeout(tmp_path, monkeypatch):
+async def test_post_connect_initialization_retries_fingerprint_after_timeout(
+    tmp_path, monkeypatch, caplog
+):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
 
@@ -453,8 +455,26 @@ async def test_post_connect_initialization_retries_fingerprint_after_timeout(tmp
                 "options": [],
             }
 
+    fetch_calls = 0
+
+    async def fetch_commands():
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 1:
+            await asyncio.Event().wait()
+        return []
+
+    tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand()],
+        fetch_commands=AsyncMock(side_effect=fetch_commands),
+    )
     adapter._client = SimpleNamespace(
-        tree=SimpleNamespace(get_commands=lambda: [_DesiredCommand()]),
+        tree=tree,
+        http=SimpleNamespace(
+            upsert_global_command=AsyncMock(),
+            edit_global_command=AsyncMock(),
+            delete_global_command=AsyncMock(),
+        ),
         application_id=999,
         user=SimpleNamespace(id=999),
     )
@@ -487,8 +507,7 @@ async def test_post_connect_initialization_retries_fingerprint_after_timeout(tmp
         "created": 1,
         "deleted": 0,
     }
-    sync = AsyncMock(side_effect=[asyncio.TimeoutError(), summary])
-    monkeypatch.setattr(adapter, "_safe_sync_slash_commands", sync)
+    monkeypatch.setattr(discord_platform, "_DISCORD_SAFE_COMMAND_SYNC_TIMEOUT_SECONDS", 0.01)
 
     await adapter._run_post_connect_initialization()
 
@@ -496,13 +515,114 @@ async def test_post_connect_initialization_retries_fingerprint_after_timeout(tmp
     assert timed_out_entry["fingerprint"] == desired_fingerprint
     assert "last_success_at" not in timed_out_entry
     assert "summary" not in timed_out_entry
+    assert caplog.text.count("slash_reconcile_timeout") == 1
+    assert "policy=safe timeout_seconds=0" in caplog.text
+    assert "slash_reconcile_cancelled" not in caplog.text
 
     await adapter._run_post_connect_initialization()
 
-    assert sync.await_count == 2
+    assert tree.fetch_commands.await_count == 2
     recovered_entry = json.loads(state_path.read_text(encoding="utf-8"))["999"]
     assert recovered_entry["last_success_at"] >= recovered_entry["last_attempt_at"]
     assert recovered_entry["summary"] == summary
+
+
+@pytest.mark.asyncio
+async def test_bulk_sync_timeout_reports_bulk_policy_without_safe_diagnostics(
+    monkeypatch, caplog
+):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    async def blocked_sync():
+        await asyncio.Event().wait()
+
+    adapter._client = SimpleNamespace(tree=SimpleNamespace(sync=blocked_sync))
+    adapter._command_sync_diagnostics = {
+        "desired": 99,
+        "existing": 98,
+        "mutations_started": 97,
+    }
+    assert discord_platform._DISCORD_BULK_COMMAND_SYNC_TIMEOUT_SECONDS == 30.0
+    monkeypatch.setattr(adapter, "_get_discord_command_sync_policy", lambda: "bulk")
+    monkeypatch.setattr(discord_platform, "_DISCORD_BULK_COMMAND_SYNC_TIMEOUT_SECONDS", 0.01)
+    caplog.set_level("INFO", logger="plugins.platforms.discord.adapter")
+
+    await adapter._run_post_connect_initialization()
+
+    assert caplog.text.count("slash_reconcile_timeout") == 1
+    assert "policy=bulk timeout_seconds=0" in caplog.text
+    assert "desired=" not in caplog.text
+    assert "existing=" not in caplog.text
+    assert "mutations_started=" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("expanded_field", "expanded_default"),
+    [
+        ("contexts", [0, 1, 2]),
+        ("integration_types", [0, 1]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_safe_sync_reports_discord_expanded_defaults(
+    expanded_field, expanded_default, caplog
+):
+    """Discord expands omitted install/context defaults on round-trip.
+
+    Keep this as a mismatch reproduction until semantic normalization is
+    deliberately implemented: the safe sync recreates the command, and its
+    diagnostics must make the exact non-secret default expansion visible.
+    """
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    desired = {
+        "name": "status",
+        "description": "sensitive-description-must-not-be-logged",
+        "type": 1,
+        "options": [],
+    }
+    existing_payload = {**desired, expanded_field: expanded_default}
+
+    class _DesiredCommand:
+        def to_dict(self, tree):
+            return dict(desired)
+
+    class _ExistingCommand:
+        id = 42
+        name = "status"
+        type = SimpleNamespace(value=1)
+
+        def to_dict(self):
+            return {
+                "id": self.id,
+                "application_id": 999,
+                **existing_payload,
+            }
+
+    fake_http = SimpleNamespace(
+        upsert_global_command=AsyncMock(),
+        edit_global_command=AsyncMock(),
+        delete_global_command=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        tree=SimpleNamespace(
+            get_commands=lambda: [_DesiredCommand()],
+            fetch_commands=AsyncMock(return_value=[_ExistingCommand()]),
+        ),
+        http=fake_http,
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+    caplog.set_level("INFO", logger="plugins.platforms.discord.adapter")
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary["recreated"] == 1
+    assert "slash_reconcile_fetch_complete desired=1 existing=1" in caplog.text
+    assert f"differing_fields={expanded_field}" in caplog.text
+    assert f"{expanded_field}_desired=default" in caplog.text
+    assert f"{expanded_field}_existing={expanded_default}" in caplog.text
+    assert "sensitive-description-must-not-be-logged" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -706,4 +826,3 @@ class TestPrivilegedIntentsRequiredFatal:
         assert "Message Content Intent" in (adapter.fatal_error_message or "")
         assert "discord.com/developers/applications" in (adapter.fatal_error_message or "")
         assert adapter._bot_task is None
-
